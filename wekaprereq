@@ -13,7 +13,7 @@ yum install -y network-scripts libaio libaio-devel lshw nvme-cli nfs-utils tar w
 sleep 5
 yum install -y tcsh tcl sysstat ipmitool dstat nmap net-tools numactl numactl-devel
 sleep 5
-yum install -y jq fio tcpdump perl lsof strace iperf3 tmux screen
+yum install -y jq fio tcpdump perl lsof strace iperf3 tmux screen ntsysv
 
 echo "adding numa"
 echo "==========="
