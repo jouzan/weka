@@ -1,0 +1,27 @@
+#!/bin/bash
+
+##############################################
+#  Install weka pre req OS software and tools 
+#
+#
+#
+###############################################################
+
+yum install -y gcc-gfortran elfutils-libelf-devel glibc glibc-headers glibc-devel make gcc rpcbind
+sleep 5
+yum install -y network-scripts libaio libaio-devel lshw nvme-cli nfs-utils tar wget bind-utils
+sleep 5
+yum install -y tcsh tcl sysstat ipmitool dstat nmap net-tools numactl numactl-devel
+sleep 5
+yum install -y jq fio tcpdump perl lsof strace iperf3 tmux screen
+
+echo "adding numa"
+echo "==========="
+echo "kernel.numa_balancing=0" >> /etc/sysctl.conf
+echo " " 
+
+echo "rebooting server in 5 sec"
+sleep 5 
+reboot
+
+
