@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ##############################################
-#  Install weka pre req OS software and tools 
+#  Install weka pre req OS software and tools
 #
 #
 #
@@ -15,13 +15,30 @@ yum install -y tcsh tcl sysstat ipmitool dstat nmap net-tools numactl numactl-de
 sleep 5
 yum install -y jq fio tcpdump perl lsof strace iperf3 tmux screen ntsysv
 
+clear
+echo " "
+echo "INSTALLED SOFTWARE:"
+echo "++++++++++++++++++"
+echo "     +++++++      "
+echo " "
+
+rpm -qa |egrep 'gcc-gfortran|elfutils-libelf-devel|glibc-headers|glibc|glibc-devel|make|gcc|rpcbind'
+echo "=============================="
+rpm -qa |egrep 'network-scripts|libaio|libaio-devel|lshw|nvme-cli|nfs-utils|tar|wget|bind-utils'
+echo "=============================="
+rpm -qa |egrep 'tcsh|tcl|sysstat|ipmitool|dstat|nmap|net-tools|numactl|numactl-devel|fio|jq|perl|lsof|strace|iperf3|tmux|screen|ntsysv'
+
+
+sleep 5
+
 echo "adding numa"
 echo "==========="
 echo "kernel.numa_balancing=0" >> /etc/sysctl.conf
-echo " " 
+echo " "
 
 echo "rebooting server in 5 sec"
-sleep 5 
+sleep 5
 reboot
+
 
 
