@@ -13,9 +13,9 @@ Weka related scrips
 6. Download weka
 7. Install weka 
 
-curl http://192.168.44.234:14000/dist/v1/install | sh
-weka version get --set-current 4.2.5 --from 192.168.44.234:14000
-weka local start
+a. curl http://192.168.44.234:14000/dist/v1/install | sh
+b. weka version get --set-current 4.2.5 --from 192.168.44.234:14000
+c. weka local start
 
 
 9. weka local ps
