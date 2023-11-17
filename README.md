@@ -5,14 +5,24 @@ Weka related scrips
 ## ================================
 
 
-1. setup statis IP
-2. Setup MTU 9001
-3. Setup network-scripts
-4. disable network manager
-5. Install software tools
-6. Download weka
-7. Install weka 
+1. Make sure space on OS drie is 500GB min
+2. setup statis IP
+3. Setup MTU 9001
+4. Setup network-scripts
+5. disable network manager
+6. Install software tools
 
+# Download weka and install it on one server 
+## =========================================================================
+6. Download weka
+   wget --auth-no-challenge https://4kl036ikhstPZQ8P:@get.weka.io/dist/v1/pkg/weka-4.2.5.tar
+8. Install weka
+   tar -xvf weka-4.2.5.tar
+   cd /weka
+   ./install.sh 
+
+# Download weka and install it on other server from the first server  
+## ========================================================================
 1.  curl http://192.168.44.234:14000/dist/v1/install | sh
 2.  weka version get --set-current 4.2.5 --from 192.168.44.234:14000
 3.  weka local start
