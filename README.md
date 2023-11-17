@@ -36,6 +36,48 @@ Weka related scrips
 ## ========================================================================
 weka cluster create weka1 weka2 weka3 weka4 weka5 --host-ips=192.168.44.234,192.168.37.176,192.168.36.189,192.168.32.189,192.168.45.209
 
-use browser to loginto the portal http://192.168.44.234:14000
+you can now use browser to loginto the portal http://192.168.44.234:14000   admin  admin    
+
+weka cluster update --cluster-name WEKADEV 
+
+weka clous enable 
+
+weka cloud status 
+
+weka cluster containers dedicate 0 on        [do that for all hosts ] 
+for i in {0..4} ; do weka cluster container dedicate $i on ; done
+
+for i in {0..5} ; do weka cluster container net add $i eth0 --gateway 192.168.31.1 --netmask 20 ; done 
+
+for i in {0..5} ; do weka cluster container cores $i 19 --frontend-dedicated-cores 1 --drives-dedicated-cores 6 ; done  
+
+for i in {0..5} ; do weka cluster container drive add $i /dev/sdb /dev/sdc /dev/sdd /dev/sde /dev/sdf /dev/sdh ; done  
+
+# Confiure protection parity and spare  
+## ========================================================================
+
+weka cluster update --data-drives 4 --parity-drives 2 
+
+weka cluster hotspare 1 
+
+
+# Verify 
+## ========================================================================
+
+weka cluster drive 
+weka cluster container resources 0 
+weka status 
+
+weka cluster container apply --all --force        [now the status will be ready   ] 
+
+
+# Verify 
+## ========================================================================
+weka cluster start-io     
+weka status     [you will see drives are up,  capacity   , cloud connection  ,  see alerts on system ] 
+
+
+
+
 
 
