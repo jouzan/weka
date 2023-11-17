@@ -1,5 +1,6 @@
 # weka
 Weka related scrips 
+https://docs.weka.io/install/bare-metal/setting-up-the-hosts#configure-the-ha-networking
 
 # Install Linux OS pre req
 ## ================================
