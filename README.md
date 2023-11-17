@@ -31,6 +31,11 @@ Weka related scrips
 4.  eka local ps
 5.  weka status
 6. . weka version
-    
-7.  configure / create cluster
+
+# Confiure cluster 
+## ========================================================================
 weka cluster create weka1 weka2 weka3 weka4 weka5 --host-ips=192.168.44.234,192.168.37.176,192.168.36.189,192.168.32.189,192.168.45.209
+
+use browser to loginto the portal http://192.168.44.234:14000
+
+
