@@ -74,7 +74,7 @@ weka cluster container apply --all --force        [now the status will be ready 
 # Verify 
 ## ========================================================================
 weka cluster start-io     
-weka status     [you will see drives are up,  capacity   , cloud connection  ,  see alerts on system ] 
+weka status     [you will see drives are up,  capacity   , cloud connection  ,  see alerts on system  , the licnese ] 
 
 
 
