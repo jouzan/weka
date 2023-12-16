@@ -1,0 +1,2579 @@
+{
+    "TemplateBody": {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Description": "[WekaIO] To learn more about this template visit https://docs.weka.io/install/aws/cloudformation",
+        "Mappings": {
+            "RegionMap": {
+                "ap-south-1": {
+                    "DownloadRegion": "ap-south-1"
+                },
+                "eu-west-2": {
+                    "DownloadRegion": "eu-west-2"
+                },
+                "eu-west-1": {
+                    "DownloadRegion": "eu-west-1"
+                },
+                "ap-northeast-2": {
+                    "DownloadRegion": "ap-northeast-2"
+                },
+                "ap-northeast-1": {
+                    "DownloadRegion": "ap-northeast-1"
+                },
+                "ap-northeast-3": {
+                    "DownloadRegion": "ap-northeast-1"
+                },
+                "sa-east-1": {
+                    "DownloadRegion": "sa-east-1"
+                },
+                "ca-central-1": {
+                    "DownloadRegion": "ca-central-1"
+                },
+                "ap-southeast-1": {
+                    "DownloadRegion": "ap-southeast-1"
+                },
+                "ap-southeast-2": {
+                    "DownloadRegion": "ap-southeast-2"
+                },
+                "eu-central-1": {
+                    "DownloadRegion": "eu-central-1"
+                },
+                "eu-north-1": {
+                    "DownloadRegion": "eu-north-1"
+                },
+                "me-south-1": {
+                    "DownloadRegion": "me-south-1"
+                },
+                "us-east-1": {
+                    "DownloadRegion": "us-east-1"
+                },
+                "us-east-2": {
+                    "DownloadRegion": "us-east-2"
+                },
+                "us-west-1": {
+                    "DownloadRegion": "us-west-1"
+                },
+                "us-west-2": {
+                    "DownloadRegion": "us-west-2"
+                },
+                "cn-northwest-1": {
+                    "DownloadRegion": "ap-southeast-1"
+                },
+                "cn-north-1": {
+                    "DownloadRegion": "ap-southeast-1"
+                }
+            },
+            "ScriptsMap": {
+                "CloudInit": {
+                    "InstanceBoot": "export USER=root\nexport HOME=/root\n\nexec 1> >(logger -s -t wekaio-instance-boot) 2>&1\n\nmkdir -p /tmp/wekaio\ncd /tmp/wekaio\n\n# https://gist.github.com/fungusakafungus/1026804\nfunction retry {\n    local retry_max=$1\n    local retry_sleep=$2\n    shift 2\n\n    local count=$retry_max\n    while [ $count -gt 0 ]; do\n        \"$@\" && break\n        count=$(($count - 1))\n        sleep $retry_sleep\n    done\n\n    [ $count -eq 0 ] && {\n        echo \"Retry failed [$retry_max]: $@\"\n        return 1\n    }\n    return 0\n}\n\n#--------------------------------------#\n# Wait Condition Signalling            #\n#--------------------------------------#\n\nfunction cf_signal_success() {\n    local reason=\"$1\"\n    echo \"----------------------------------------------------------------------\"\n    echo \"Reporting SUCCESS to CloudFormation: ${reason}\"\n    echo \"----------------------------------------------------------------------\"\n    retry 5 1 curl -v --noproxy \".amazonaws.com\" --proxy \"${PROXY}\" -X PUT -H 'Content-Type:' \\\n          -d '{\"Status\":\"SUCCESS\",\"Reason\":\"'\"${reason}\"'\",\"UniqueId\":\"'\"${WEKA_THIS_INSTANCE}\"'\",\"Data\":\"\"}' \\\n          \"${WEKA_CF_CONDITION_HANDLE}\"\n}\n\nexport SEE_LOGS_TEXT='please see '\"${WEKA_LOG_GROUP_NAME}\"' in CloudWatch for details'\n\nfunction cf_signal_failure() {\n    local reason=\"$1\"\n    echo \"----------------------------------------------------------------------\"\n    echo \"Reporting FAILURE to CloudFormation: ${reason}\"\n    echo \"----------------------------------------------------------------------\"\n    retry 5 1 curl -v --noproxy \".amazonaws.com\" --proxy \"${PROXY}\" -X PUT -H 'Content-Type:' \\\n          -d '{\"Status\":\"FAILURE\",\"Reason\":\"'\"${reason}\"'\",\"UniqueId\":\"'\"${WEKA_THIS_INSTANCE}\"'\",\"Data\":\"\"}' \\\n          \"${WEKA_CF_CONDITION_HANDLE}\"\n    exit 1\n}\n\n#--------------------------------------#\n# AWS Logs Agent                       #\n#--------------------------------------#\n\nfunction configure_aws_logs_agent() {\n        cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF\n        {\n      \"agent\": {\n        \"metrics_collection_interval\": 10,\n        \"logfile\": \"/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log\"\n      },\n      \"logs\": {\n        \"logs_collected\": {\n          \"files\": {\n            \"collect_list\": [\n              {\n                \"file_path\": \"/var/log/messages\",\n                \"log_group_name\": \"${WEKA_LOG_GROUP_NAME}\",\n                \"log_stream_name\": \"${WEKA_THIS_INSTANCE}-syslog\",\n                \"timezone\": \"LOCAL\",\n                \"timestamp_format\": \"%b %d %H:%M:%S\"\n              }\n            ]\n          }\n        },\n        \"log_stream_name\": \"${WEKA_THIS_INSTANCE}-syslog\",\n        \"force_flush_interval\" : 15\n      }\n    }\nEOF\n\n    cat > /opt/aws/amazon-cloudwatch-agent/etc/common-config.toml <<EOF\n    [proxy]\n    https_proxy=\"${PROXY}\"\nEOF\n}\n\n# From http://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/EC2NewInstanceCWL.html\nfunction setup_aws_logs_agent() {\n    echo \"---------------------------\"\n    echo \" Setting up AWS logs agent \"\n    echo \"---------------------------\"\n\n    no_proxy=\".amazonaws.com\" https_proxy=\"${PROXY}\" retry 5 3 yum install -y amazon-cloudwatch-agent.x86_64 || return 1\n    configure_aws_logs_agent || return 1\n    service amazon-cloudwatch-agent restart || return 1\n}\n\n#--------------------------------------#\n# Installation                         #\n#--------------------------------------#\n\nfunction create_wekaio_partition() {\n    echo \"--------------------------------------------\"\n    echo \" Creating local filesystem on WekaIO volume \"\n    echo \"--------------------------------------------\"\n\n    if [ -e /dev/xvdp ]\n    then\n        wekaiosw_device=\"/dev/xvdp\"\n    elif [ -e /dev/sdp ]\n    then\n        wekaiosw_device=\"/dev/sdp\"\n    elif [ -e /dev/nvme1n1 ]\n    then\n        wekaiosw_device=\"/dev/nvme1n1\"\n    else\n        echo \"error: Could not find the WekaIO software block device. This may be the result of a new kernel not exposing the device in the known paths.\"\n        return 1\n    fi\n\n    sleep 4\n    mkfs.ext4 -L wekaiosw ${wekaiosw_device} || return 1\n    mkdir -p /opt/weka || return 1\n    mount $wekaiosw_device /opt/weka || return 1\n    echo \"LABEL=wekaiosw /opt/weka ext4 defaults 0 2\" >>/etc/fstab\n}\n\nfunction prepare_weka_env() {\n    (setup_aws_logs_agent) || echo \"Failed to setup AWS logs agent\"\n    echo \"--------------- ENV ---------------\"\n    env\n    echo \"--------------- ENV ---------------\"\n    create_wekaio_partition || cf_signal_failure \"Failed creating wekaio partition, ${SEE_LOGS_TEXT}\"\n}\n\nfunction install_wekaio() {\n    echo \"-------------------\"\n    echo \" Installing WekaIO \"\n    echo \"-------------------\"\n\n    if [ -z \"${WEKA_PKG_URL}\" ]\n    then\n        local download_url=\"${WEKA_INSTALL_URL}?provider=aws&region=${WEKA_AWS_DOWNLOAD_REGION}\"\n        echo \"Downloading: ${download_url} using proxy: ${PROXY}\"\n        (mkdir -p ${WEKA_VERSION} &&\n         cd ${WEKA_VERSION} &&\n         retry 200 3 curl --fail --proxy \"${PROXY}\" -u ${WEKA_DIST_TOKEN}: -L \"${download_url}\" -o install.sh &&\n         chmod +x install.sh\n         PROXY=\"${PROXY}\" ./install.sh\n        )\n    else\n        local download_url=\"${WEKA_PKG_URL}?provider=aws&region=${WEKA_AWS_DOWNLOAD_REGION}\"\n        echo \"Downloading: ${download_url}\"\n        (mkdir -p ${WEKA_VERSION} &&\n         cd ${WEKA_VERSION} &&\n         retry 200 3 curl --fail -u ${WEKA_DIST_TOKEN}: -L \"${download_url}\" -o ${WEKA_VERSION}.tar &&\n         tar --strip-components=1 -xvf ${WEKA_VERSION}.tar &&\n         ./install.sh\n        )\n    fi\n}\n\nfunction change_base_port() {\n    echo \"Changing base-port of the default container to port 18000\"\n    weka local resources base-port 18000 || cf_signal_failure \"changing base-port on default container failed, ${SEE_LOGS_TEXT}\"\n    weka local resources apply -f || cf_signal_failure \"applying base-port on default container failed, ${SEE_LOGS_TEXT}\"\n}\n\nfunction install_weka_backend() {\n    prepare_weka_env\n    install_wekaio || cf_signal_failure \"Installation failed, ${SEE_LOGS_TEXT}\"\n    wait_for_weka_to_start || cf_signal_failure \"Timed out waiting for weka to start on this instance, ${SEE_LOGS_TEXT}\"\n    change_base_port || cf_signal_failure \"Failed re-setting base-port on default container on this instance, ${SEE_LOGS_TEXT}\"\n}\n\nfunction boot_server() {\n    echo \"Booting server\"\n\n    # setting only 'https_proxy' env var, because boto3 fails when http_proxy is set\n    # example of exception we get when the http_proxy is set:\n    # \"botocore.exceptions.ClientError: An error occurred (UnauthorizedOperation) when calling the DescribeInstances operation: You are not authorized to perform this operation.\"\n    weka local run \\\n         -e https_proxy=\"${PROXY}\" \\\n         -e NO_PROXY=\"${NO_PROXY}\" \\\n         aws-create-server \\\n         --verbose\n}\n\n#--------------------------------------#\n# Cluster Preparation                  #\n#--------------------------------------#\n\n\nfunction prepare_cluster() {\n    echo \"Preparing cluster\"\n    if [ ! -z \"${WEKA_PROTECTION}\" ]\n    then\n        protection_option=\"--stripe-protection-drives ${WEKA_PROTECTION}\"\n    fi\n    if [ ! -z \"${WEKA_AZ_COUNT}\" ]\n    then\n        az_count_option=\"--az-count ${WEKA_AZ_COUNT}\"\n    fi\n\n    # setting only 'https_proxy' env var, because boto3 fails when http_proxy is set\n    # example of exception we get when the http_proxy is set:\n    # \"botocore.exceptions.ClientError: An error occurred (UnauthorizedOperation) when calling the DescribeInstances operation: You are not authorized to perform this operation.\"\n    weka local run \\\n         -e https_proxy=\"${PROXY}\" \\\n         -e NO_PROXY=\"${NO_PROXY}\" \\\n         aws-prepare-cluster \\\n         --wait-time \"${WEKA_INSTANCES_WAIT_TIME}\" \\\n         --tag \"WekaInstallationId=Backend-${WEKA_INSTALLATION_ID}\" \\\n         ${protection_option} \\\n         ${az_count_option} \\\n         --verbose \\\n         --no-remote-logs\n}\n\n#--------------------------------------#\n# Cluster Creation                     #\n#--------------------------------------#\n\nfunction wait_for_weka_to_start() {\n    for attempt in `seq 1 60`\n    do\n        echo \"Waiting for weka to start ($attempt)\"\n        if (weka local run wapi -H 127.0.0.1 status 2>/dev/null)\n        then\n            break\n        fi\n        sleep 3\n    done\n\n    if weka local run wapi -H 127.0.0.1 status\n    then\n        echo \"Weka has started on this instance\"\n    else\n        return 1\n    fi\n}\n\nfunction has_one_filesystem() {\n    [[ $(WEKA_USERNAME=admin WEKA_PASSWORD=\"${WEKA_ADMIN_PASSWORD:-admin}\" weka fs -o name --no-header 2>/dev/null | wc -l) -gt 0 ]]\n}\n\nfunction wait_for_cluster_boot() {\n    for attempt in `seq 1 600`\n    do\n        echo \"Waiting for cluster to finish booting ($attempt)\"\n        if has_one_filesystem\n        then\n            break\n        fi\n        sleep 3\n    done\n\n    if has_one_filesystem\n    then\n        echo \"Cluster is up\"\n    else\n        echo \"error: Timed out waiting for cluster to boot\"\n        return 1\n    fi\n}\n\nfunction form_cluster() {\n    echo \"Forming cluster\"\n    if [ ! -z \"${WEKA_PROTECTION}\" ]\n    then\n        protection_option=\"--stripe-protection-drives ${WEKA_PROTECTION}\"\n    fi\n    if [ ! -z \"${WEKA_AZ_COUNT}\" ]\n    then\n        az_count_option=\"--az-count ${WEKA_AZ_COUNT}\"\n    fi\n\n    if [ ! -z \"${CONTAINER_TO_CLUSTERIZE}\" ]\n    then\n        container_to_clusterize=\"${CONTAINER_TO_CLUSTERIZE}\"\n    else\n        container_to_clusterize=\"drives0\"\n    fi\n\n    # setting only 'https_proxy' env var, because boto3 fails when http_proxy is set\n    # example of exception we get when the http_proxy is set:\n    # \"botocore.exceptions.ClientError: An error occurred (UnauthorizedOperation) when calling the DescribeInstances operation: You are not authorized to perform this operation.\"\n    weka local run \\\n         -C ${container_to_clusterize} \\\n         -e https_proxy=\"${PROXY}\" \\\n         -e NO_PROXY=\"${NO_PROXY}\" \\\n         aws-form-cluster \\\n         --name \"${WEKA_CLUSTER_NAME}\" \\\n         --tag \"WekaInstallationId=Backend-${WEKA_INSTALLATION_ID}\" \\\n         ${protection_option} \\\n         ${az_count_option} \\\n         --admin-password=\"${WEKA_ADMIN_PASSWORD}\" \\\n         --tiering-bucket-name=\"${WEKA_TIERING_S3_BUCKET}\" \\\n         --tiering-ssd-percent=\"${WEKA_TIERING_SSD_PERCENT}\" \\\n         --token=\"${WEKA_DIST_TOKEN}\"\n}\n\nfunction backend_mount_default_filesystem() {\n    echo \"Mounting filesystem\"\n    mkdir -p /mnt/weka\n    mount -t wekafs default /mnt/weka\n}\n\nfunction start_weka_backend() {\n    install_weka_backend\n\n    if [ \"$WEKA_THIS_INSTANCE\" = \"Backend0\" ]\n    then\n        prepare_cluster || cf_signal_failure \"Cluster preparation failed, ${SEE_LOGS_TEXT}\"\n    else\n        # in a perfect world, we'd get a real signal that the clusterizer finished.\n        # but it's not that critical to be absolutly synced here, so waiting it out.\n        echo \"Waiting 10 seconds to allow clusterizer to verify configuration and fail early\"\n        sleep 10\n    fi\n\n    boot_server || cf_signal_failure \"Server boot failed, ${SEE_LOGS_TEXT}\"\n\n    if [ \"$WEKA_THIS_INSTANCE\" = \"Backend0\" ]\n    then\n        # TODO: add an api to ensure all containers are up before forming?\n        form_cluster || cf_signal_failure \"Cluster boot failed, ${SEE_LOGS_TEXT}\"\n        cf_signal_success \"Installation successful\"\n    else\n        echo \"Waiting for cluster to boot\"\n        wait_for_cluster_boot || cf_signal_failure \"Timed out waiting for cluster to boot, ${SEE_LOGS_TEXT}\"\n    fi\n\n    backend_mount_default_filesystem\n}\n\n#--------------------------------------#\n# Clients                              #\n#--------------------------------------#\n\nfunction start_weka_client() {\n    prepare_weka_env\n\n    echo \"Installing agent from ${WEKA_HOST}\"\n    (retry 300 2 curl --fail --max-time 10 \"http://${WEKA_HOST}:14000/dist/v1/install\" | sh) || cf_signal_failure \"Failed installing agent from the first backend, ${SEE_LOGS_TEXT}\"\n\n    echo \"Waiting for cluster to boot\"\n    wait_for_cluster_boot || cf_signal_failure \"Timed out waiting for cluster to boot, ${SEE_LOGS_TEXT}\"\n\n    mkdir -p /mnt/weka\n    mount -t wekafs ${WEKA_HOST}/default /mnt/weka || cf_signal_failure \"Error mounting filesystem, ${SEE_LOGS_TEXT}\"\n\n    cf_signal_success \"Installation successful\"\n}\n"
+                }
+            }
+        },
+        "Resources": {
+            "LogGroup": {
+                "Type": "AWS::Logs::LogGroup",
+                "DeletionPolicy": "Retain",
+                "Properties": {
+                    "LogGroupName": {
+                        "Fn::Join": [
+                            "",
+                            [
+                                "/wekaio/",
+                                {
+                                    "Ref": "AWS::StackName"
+                                },
+                                "-",
+                                {
+                                    "Fn::Select": [
+                                        0,
+                                        {
+                                            "Fn::Split": [
+                                                "-",
+                                                {
+                                                    "Fn::Select": [
+                                                        2,
+                                                        {
+                                                            "Fn::Split": [
+                                                                "/",
+                                                                {
+                                                                    "Ref": "AWS::StackId"
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ]
+                        ]
+                    },
+                    "RetentionInDays": 30
+                }
+            },
+            "InstancesPlacementGroup": {
+                "Type": "AWS::EC2::PlacementGroup",
+                "Properties": {
+                    "Strategy": "cluster"
+                }
+            },
+            "HostSecurityGroup": {
+                "Type": "AWS::EC2::SecurityGroup",
+                "Properties": {
+                    "GroupDescription": "WekaIO instance security group",
+                    "VpcId": {
+                        "Ref": "VpcId"
+                    }
+                }
+            },
+            "HostSecurityGroupSSHIn": {
+                "Type": "AWS::EC2::SecurityGroupIngress",
+                "Properties": {
+                    "IpProtocol": "tcp",
+                    "FromPort": 22,
+                    "ToPort": 22,
+                    "CidrIp": "0.0.0.0/0",
+                    "GroupId": {
+                        "Fn::GetAtt": [
+                            "HostSecurityGroup",
+                            "GroupId"
+                        ]
+                    }
+                }
+            },
+            "HostSecurityGroupUIIn": {
+                "Type": "AWS::EC2::SecurityGroupIngress",
+                "Properties": {
+                    "IpProtocol": "tcp",
+                    "FromPort": 14000,
+                    "ToPort": 14000,
+                    "CidrIp": "0.0.0.0/0",
+                    "GroupId": {
+                        "Fn::GetAtt": [
+                            "HostSecurityGroup",
+                            "GroupId"
+                        ]
+                    }
+                }
+            },
+            "HostSecurityGroupInternalIngress": {
+                "Type": "AWS::EC2::SecurityGroupIngress",
+                "Properties": {
+                    "IpProtocol": "-1",
+                    "SourceSecurityGroupId": {
+                        "Fn::GetAtt": [
+                            "HostSecurityGroup",
+                            "GroupId"
+                        ]
+                    },
+                    "GroupId": {
+                        "Fn::GetAtt": [
+                            "HostSecurityGroup",
+                            "GroupId"
+                        ]
+                    }
+                }
+            },
+            "HostSecurityGroupInternalEgress": {
+                "Type": "AWS::EC2::SecurityGroupEgress",
+                "Properties": {
+                    "IpProtocol": "-1",
+                    "FromPort": 0,
+                    "ToPort": 65535,
+                    "CidrIp": "0.0.0.0/0",
+                    "GroupId": {
+                        "Fn::GetAtt": [
+                            "HostSecurityGroup",
+                            "GroupId"
+                        ]
+                    }
+                }
+            },
+            "WekaBackendRole": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "AssumeRolePolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Principal": {
+                                    "Service": [
+                                        {
+                                            "Fn::Join": [
+                                                "",
+                                                [
+                                                    "ec2.",
+                                                    {
+                                                        "Ref": "AWS::URLSuffix"
+                                                    }
+                                                ]
+                                            ]
+                                        }
+                                    ]
+                                },
+                                "Action": [
+                                    "sts:AssumeRole"
+                                ]
+                            }
+                        ]
+                    },
+                    "Path": "/"
+                }
+            },
+            "WekaClientRole": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {
+                    "AssumeRolePolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Principal": {
+                                    "Service": [
+                                        {
+                                            "Fn::Join": [
+                                                "",
+                                                [
+                                                    "ec2.",
+                                                    {
+                                                        "Ref": "AWS::URLSuffix"
+                                                    }
+                                                ]
+                                            ]
+                                        }
+                                    ]
+                                },
+                                "Action": [
+                                    "sts:AssumeRole"
+                                ]
+                            }
+                        ]
+                    },
+                    "Path": "/"
+                }
+            },
+            "EniCreationPolicy": {
+                "Type": "AWS::IAM::Policy",
+                "Properties": {
+                    "PolicyName": "EniCreation",
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": [
+                                    "ec2:DescribeInstances",
+                                    "ec2:DescribeNetworkInterfaces",
+                                    "ec2:AttachNetworkInterface",
+                                    "ec2:CreateNetworkInterface",
+                                    "ec2:ModifyNetworkInterfaceAttribute",
+                                    "ec2:DeleteNetworkInterface"
+                                ],
+                                "Resource": "*"
+                            }
+                        ]
+                    },
+                    "Roles": [
+                        {
+                            "Ref": "WekaBackendRole"
+                        },
+                        {
+                            "Ref": "WekaClientRole"
+                        }
+                    ]
+                }
+            },
+            "HostCloudWatchPolicy": {
+                "Type": "AWS::IAM::Policy",
+                "Properties": {
+                    "PolicyName": "SendLogsToCloudWatch",
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": [
+                                    "logs:CreateLogGroup",
+                                    "logs:CreateLogStream",
+                                    "logs:PutLogEvents",
+                                    "logs:DescribeLogStreams"
+                                ],
+                                "Resource": [
+                                    {
+                                        "Fn::Join": [
+                                            "",
+                                            [
+                                                "arn:",
+                                                {
+                                                    "Ref": "AWS::Partition"
+                                                },
+                                                ":logs:*:*:log-group:",
+                                                {
+                                                    "Fn::Join": [
+                                                        "",
+                                                        [
+                                                            "/wekaio/",
+                                                            {
+                                                                "Ref": "AWS::StackName"
+                                                            },
+                                                            "-",
+                                                            {
+                                                                "Fn::Select": [
+                                                                    0,
+                                                                    {
+                                                                        "Fn::Split": [
+                                                                            "-",
+                                                                            {
+                                                                                "Fn::Select": [
+                                                                                    2,
+                                                                                    {
+                                                                                        "Fn::Split": [
+                                                                                            "/",
+                                                                                            {
+                                                                                                "Ref": "AWS::StackId"
+                                                                                            }
+                                                                                        ]
+                                                                                    }
+                                                                                ]
+                                                                            }
+                                                                        ]
+                                                                    }
+                                                                ]
+                                                            }
+                                                        ]
+                                                    ]
+                                                }
+                                            ]
+                                        ]
+                                    },
+                                    {
+                                        "Fn::Join": [
+                                            "",
+                                            [
+                                                "arn:",
+                                                {
+                                                    "Ref": "AWS::Partition"
+                                                },
+                                                ":logs:*:*:log-group:",
+                                                {
+                                                    "Fn::Join": [
+                                                        "",
+                                                        [
+                                                            "/wekaio/",
+                                                            {
+                                                                "Ref": "AWS::StackName"
+                                                            },
+                                                            "-",
+                                                            {
+                                                                "Fn::Select": [
+                                                                    0,
+                                                                    {
+                                                                        "Fn::Split": [
+                                                                            "-",
+                                                                            {
+                                                                                "Fn::Select": [
+                                                                                    2,
+                                                                                    {
+                                                                                        "Fn::Split": [
+                                                                                            "/",
+                                                                                            {
+                                                                                                "Ref": "AWS::StackId"
+                                                                                            }
+                                                                                        ]
+                                                                                    }
+                                                                                ]
+                                                                            }
+                                                                        ]
+                                                                    }
+                                                                ]
+                                                            }
+                                                        ]
+                                                    ]
+                                                },
+                                                ":*"
+                                            ]
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    "Roles": [
+                        {
+                            "Ref": "WekaBackendRole"
+                        },
+                        {
+                            "Ref": "WekaClientRole"
+                        }
+                    ]
+                }
+            },
+            "InstanceProfileBackend": {
+                "Type": "AWS::IAM::InstanceProfile",
+                "Properties": {
+                    "Path": "/",
+                    "Roles": [
+                        {
+                            "Ref": "WekaBackendRole"
+                        }
+                    ]
+                }
+            },
+            "InstanceProfileClient": {
+                "Type": "AWS::IAM::InstanceProfile",
+                "Properties": {
+                    "Path": "/",
+                    "Roles": [
+                        {
+                            "Ref": "WekaClientRole"
+                        }
+                    ]
+                }
+            },
+            "ClusterBootHandle": {
+                "Type": "AWS::CloudFormation::WaitConditionHandle",
+                "Properties": {}
+            },
+            "ClusterBootCondition": {
+                "Type": "AWS::CloudFormation::WaitCondition",
+                "Properties": {
+                    "Handle": {
+                        "Ref": "ClusterBootHandle"
+                    },
+                    "Timeout": "43199"
+                }
+            },
+            "ClientsJoinHandle": {
+                "Type": "AWS::CloudFormation::WaitConditionHandle",
+                "Properties": {}
+            },
+            "ClientsJoinCondition": {
+                "Type": "AWS::CloudFormation::WaitCondition",
+                "Properties": {
+                    "Handle": {
+                        "Ref": "ClientsJoinHandle"
+                    },
+                    "Count": 1,
+                    "Timeout": "43199"
+                }
+            },
+            "Backend0": {
+                "Type": "AWS::EC2::Instance",
+                "Properties": {
+                    "ImageId": "resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2",
+                    "InstanceType": "i3en.24xlarge",
+                    "KeyName": {
+                        "Ref": "KeyName"
+                    },
+                    "UserData": {
+                        "Fn::Base64": {
+                            "Fn::Join": [
+                                "",
+                                [
+                                    "#!/bin/bash -e\n",
+                                    "\n",
+                                    "export WEKA_VERSION=\"4.2.5\"\n",
+                                    "export WEKA_GET_BASE_URL=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_SERVER=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_TOKEN=\"",
+                                    {
+                                        "Ref": "DistToken"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALL_URL=\"https://get.weka.io/dist/v1/install/4.2.5/4.2.5\"\n",
+                                    "export WEKA_PKG_URL=\"\"\n",
+                                    "export WEKA_THIS_INSTANCE=\"Backend0\"\n",
+                                    "export WEKA_CLUSTER_NAME=\"",
+                                    {
+                                        "Ref": "AWS::StackName"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALLATION_ID=\"",
+                                    {
+                                        "Fn::Select": [
+                                            2,
+                                            {
+                                                "Fn::Split": [
+                                                    "/",
+                                                    {
+                                                        "Ref": "AWS::StackId"
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_LOG_GROUP_NAME=\"",
+                                    {
+                                        "Fn::Join": [
+                                            "",
+                                            [
+                                                "/wekaio/",
+                                                {
+                                                    "Ref": "AWS::StackName"
+                                                },
+                                                "-",
+                                                {
+                                                    "Fn::Select": [
+                                                        0,
+                                                        {
+                                                            "Fn::Split": [
+                                                                "-",
+                                                                {
+                                                                    "Fn::Select": [
+                                                                        2,
+                                                                        {
+                                                                            "Fn::Split": [
+                                                                                "/",
+                                                                                {
+                                                                                    "Ref": "AWS::StackId"
+                                                                                }
+                                                                            ]
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AWS_DOWNLOAD_REGION=\"",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "RegionMap",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "DownloadRegion"
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_ADMIN_PASSWORD=$(cat << 'CFN_PASSWD_EOF'\n",
+                                    {
+                                        "Ref": "AdminPassword"
+                                    },
+                                    "\nCFN_PASSWD_EOF\n)\n",
+                                    "export PROXY=\"",
+                                    {
+                                        "Fn::If": [
+                                            "UseWekaProxy",
+                                            "http://private.prod.weka.io:1080",
+                                            {
+                                                "Fn::If": [
+                                                    "UseCustomProxy",
+                                                    {
+                                                        "Ref": "CustomProxy"
+                                                    },
+                                                    ""
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_CF_CONDITION_HANDLE=\"",
+                                    {
+                                        "Ref": "ClusterBootHandle"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AZ_COUNT=\"1\"\n",
+                                    "export WEKA_PROTECTION=\"2\"\n",
+                                    "export WEKA_TIERING_S3_BUCKET=\"",
+                                    {
+                                        "Fn::If": [
+                                            "HasTiering",
+                                            {
+                                                "Fn::If": [
+                                                    "CreateNewS3Bucket",
+                                                    {
+                                                        "Ref": "NewS3BucketName"
+                                                    },
+                                                    {
+                                                        "Ref": "ExistingS3BucketName"
+                                                    }
+                                                ]
+                                            },
+                                            ""
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_TIERING_SSD_PERCENT=\"",
+                                    {
+                                        "Ref": "TieringSsdPercent"
+                                    },
+                                    "\"\n",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "ScriptsMap",
+                                            "CloudInit",
+                                            "InstanceBoot"
+                                        ]
+                                    },
+                                    "\n",
+                                    "start_weka_backend\n"
+                                ]
+                            ]
+                        }
+                    },
+                    "IamInstanceProfile": {
+                        "Ref": "InstanceProfileBackend"
+                    },
+                    "BlockDeviceMappings": [
+                        {
+                            "DeviceName": "/dev/sdp",
+                            "Ebs": {
+                                "VolumeType": {
+                                    "Ref": "WekaVolumeType"
+                                },
+                                "VolumeSize": "188"
+                            }
+                        }
+                    ],
+                    "SubnetId": {
+                        "Ref": "SubnetId"
+                    },
+                    "SecurityGroupIds": [
+                        {
+                            "Ref": "HostSecurityGroup"
+                        }
+                    ],
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        {
+                                            "Ref": "AWS::StackName"
+                                        },
+                                        "Backend",
+                                        "0"
+                                    ]
+                                ]
+                            }
+                        },
+                        {
+                            "Key": "WekaInstallationId",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        "Backend",
+                                        {
+                                            "Fn::Select": [
+                                                2,
+                                                {
+                                                    "Fn::Split": [
+                                                        "/",
+                                                        {
+                                                            "Ref": "AWS::StackId"
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                ]
+                            }
+                        }
+                    ],
+                    "PlacementGroupName": {
+                        "Ref": "InstancesPlacementGroup"
+                    }
+                }
+            },
+            "Backend1": {
+                "Type": "AWS::EC2::Instance",
+                "Properties": {
+                    "ImageId": "resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2",
+                    "InstanceType": "i3en.24xlarge",
+                    "KeyName": {
+                        "Ref": "KeyName"
+                    },
+                    "UserData": {
+                        "Fn::Base64": {
+                            "Fn::Join": [
+                                "",
+                                [
+                                    "#!/bin/bash -e\n",
+                                    "\n",
+                                    "export WEKA_VERSION=\"4.2.5\"\n",
+                                    "export WEKA_GET_BASE_URL=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_SERVER=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_TOKEN=\"",
+                                    {
+                                        "Ref": "DistToken"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALL_URL=\"https://get.weka.io/dist/v1/install/4.2.5/4.2.5\"\n",
+                                    "export WEKA_PKG_URL=\"\"\n",
+                                    "export WEKA_THIS_INSTANCE=\"Backend1\"\n",
+                                    "export WEKA_CLUSTER_NAME=\"",
+                                    {
+                                        "Ref": "AWS::StackName"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALLATION_ID=\"",
+                                    {
+                                        "Fn::Select": [
+                                            2,
+                                            {
+                                                "Fn::Split": [
+                                                    "/",
+                                                    {
+                                                        "Ref": "AWS::StackId"
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_LOG_GROUP_NAME=\"",
+                                    {
+                                        "Fn::Join": [
+                                            "",
+                                            [
+                                                "/wekaio/",
+                                                {
+                                                    "Ref": "AWS::StackName"
+                                                },
+                                                "-",
+                                                {
+                                                    "Fn::Select": [
+                                                        0,
+                                                        {
+                                                            "Fn::Split": [
+                                                                "-",
+                                                                {
+                                                                    "Fn::Select": [
+                                                                        2,
+                                                                        {
+                                                                            "Fn::Split": [
+                                                                                "/",
+                                                                                {
+                                                                                    "Ref": "AWS::StackId"
+                                                                                }
+                                                                            ]
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AWS_DOWNLOAD_REGION=\"",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "RegionMap",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "DownloadRegion"
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_ADMIN_PASSWORD=$(cat << 'CFN_PASSWD_EOF'\n",
+                                    {
+                                        "Ref": "AdminPassword"
+                                    },
+                                    "\nCFN_PASSWD_EOF\n)\n",
+                                    "export PROXY=\"",
+                                    {
+                                        "Fn::If": [
+                                            "UseWekaProxy",
+                                            "http://private.prod.weka.io:1080",
+                                            {
+                                                "Fn::If": [
+                                                    "UseCustomProxy",
+                                                    {
+                                                        "Ref": "CustomProxy"
+                                                    },
+                                                    ""
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_CF_CONDITION_HANDLE=\"",
+                                    {
+                                        "Ref": "ClusterBootHandle"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AZ_COUNT=\"1\"\n",
+                                    "export WEKA_PROTECTION=\"2\"\n",
+                                    "export WEKA_TIERING_S3_BUCKET=\"",
+                                    {
+                                        "Fn::If": [
+                                            "HasTiering",
+                                            {
+                                                "Fn::If": [
+                                                    "CreateNewS3Bucket",
+                                                    {
+                                                        "Ref": "NewS3BucketName"
+                                                    },
+                                                    {
+                                                        "Ref": "ExistingS3BucketName"
+                                                    }
+                                                ]
+                                            },
+                                            ""
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_TIERING_SSD_PERCENT=\"",
+                                    {
+                                        "Ref": "TieringSsdPercent"
+                                    },
+                                    "\"\n",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "ScriptsMap",
+                                            "CloudInit",
+                                            "InstanceBoot"
+                                        ]
+                                    },
+                                    "\n",
+                                    "start_weka_backend\n"
+                                ]
+                            ]
+                        }
+                    },
+                    "IamInstanceProfile": {
+                        "Ref": "InstanceProfileBackend"
+                    },
+                    "BlockDeviceMappings": [
+                        {
+                            "DeviceName": "/dev/sdp",
+                            "Ebs": {
+                                "VolumeType": {
+                                    "Ref": "WekaVolumeType"
+                                },
+                                "VolumeSize": "188"
+                            }
+                        }
+                    ],
+                    "SubnetId": {
+                        "Ref": "SubnetId"
+                    },
+                    "SecurityGroupIds": [
+                        {
+                            "Ref": "HostSecurityGroup"
+                        }
+                    ],
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        {
+                                            "Ref": "AWS::StackName"
+                                        },
+                                        "Backend",
+                                        "1"
+                                    ]
+                                ]
+                            }
+                        },
+                        {
+                            "Key": "WekaInstallationId",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        "Backend",
+                                        {
+                                            "Fn::Select": [
+                                                2,
+                                                {
+                                                    "Fn::Split": [
+                                                        "/",
+                                                        {
+                                                            "Ref": "AWS::StackId"
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                ]
+                            }
+                        }
+                    ],
+                    "PlacementGroupName": {
+                        "Ref": "InstancesPlacementGroup"
+                    }
+                },
+                "DependsOn": "Backend0"
+            },
+            "Backend2": {
+                "Type": "AWS::EC2::Instance",
+                "Properties": {
+                    "ImageId": "resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2",
+                    "InstanceType": "i3en.24xlarge",
+                    "KeyName": {
+                        "Ref": "KeyName"
+                    },
+                    "UserData": {
+                        "Fn::Base64": {
+                            "Fn::Join": [
+                                "",
+                                [
+                                    "#!/bin/bash -e\n",
+                                    "\n",
+                                    "export WEKA_VERSION=\"4.2.5\"\n",
+                                    "export WEKA_GET_BASE_URL=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_SERVER=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_TOKEN=\"",
+                                    {
+                                        "Ref": "DistToken"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALL_URL=\"https://get.weka.io/dist/v1/install/4.2.5/4.2.5\"\n",
+                                    "export WEKA_PKG_URL=\"\"\n",
+                                    "export WEKA_THIS_INSTANCE=\"Backend2\"\n",
+                                    "export WEKA_CLUSTER_NAME=\"",
+                                    {
+                                        "Ref": "AWS::StackName"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALLATION_ID=\"",
+                                    {
+                                        "Fn::Select": [
+                                            2,
+                                            {
+                                                "Fn::Split": [
+                                                    "/",
+                                                    {
+                                                        "Ref": "AWS::StackId"
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_LOG_GROUP_NAME=\"",
+                                    {
+                                        "Fn::Join": [
+                                            "",
+                                            [
+                                                "/wekaio/",
+                                                {
+                                                    "Ref": "AWS::StackName"
+                                                },
+                                                "-",
+                                                {
+                                                    "Fn::Select": [
+                                                        0,
+                                                        {
+                                                            "Fn::Split": [
+                                                                "-",
+                                                                {
+                                                                    "Fn::Select": [
+                                                                        2,
+                                                                        {
+                                                                            "Fn::Split": [
+                                                                                "/",
+                                                                                {
+                                                                                    "Ref": "AWS::StackId"
+                                                                                }
+                                                                            ]
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AWS_DOWNLOAD_REGION=\"",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "RegionMap",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "DownloadRegion"
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_ADMIN_PASSWORD=$(cat << 'CFN_PASSWD_EOF'\n",
+                                    {
+                                        "Ref": "AdminPassword"
+                                    },
+                                    "\nCFN_PASSWD_EOF\n)\n",
+                                    "export PROXY=\"",
+                                    {
+                                        "Fn::If": [
+                                            "UseWekaProxy",
+                                            "http://private.prod.weka.io:1080",
+                                            {
+                                                "Fn::If": [
+                                                    "UseCustomProxy",
+                                                    {
+                                                        "Ref": "CustomProxy"
+                                                    },
+                                                    ""
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_CF_CONDITION_HANDLE=\"",
+                                    {
+                                        "Ref": "ClusterBootHandle"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AZ_COUNT=\"1\"\n",
+                                    "export WEKA_PROTECTION=\"2\"\n",
+                                    "export WEKA_TIERING_S3_BUCKET=\"",
+                                    {
+                                        "Fn::If": [
+                                            "HasTiering",
+                                            {
+                                                "Fn::If": [
+                                                    "CreateNewS3Bucket",
+                                                    {
+                                                        "Ref": "NewS3BucketName"
+                                                    },
+                                                    {
+                                                        "Ref": "ExistingS3BucketName"
+                                                    }
+                                                ]
+                                            },
+                                            ""
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_TIERING_SSD_PERCENT=\"",
+                                    {
+                                        "Ref": "TieringSsdPercent"
+                                    },
+                                    "\"\n",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "ScriptsMap",
+                                            "CloudInit",
+                                            "InstanceBoot"
+                                        ]
+                                    },
+                                    "\n",
+                                    "start_weka_backend\n"
+                                ]
+                            ]
+                        }
+                    },
+                    "IamInstanceProfile": {
+                        "Ref": "InstanceProfileBackend"
+                    },
+                    "BlockDeviceMappings": [
+                        {
+                            "DeviceName": "/dev/sdp",
+                            "Ebs": {
+                                "VolumeType": {
+                                    "Ref": "WekaVolumeType"
+                                },
+                                "VolumeSize": "188"
+                            }
+                        }
+                    ],
+                    "SubnetId": {
+                        "Ref": "SubnetId"
+                    },
+                    "SecurityGroupIds": [
+                        {
+                            "Ref": "HostSecurityGroup"
+                        }
+                    ],
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        {
+                                            "Ref": "AWS::StackName"
+                                        },
+                                        "Backend",
+                                        "2"
+                                    ]
+                                ]
+                            }
+                        },
+                        {
+                            "Key": "WekaInstallationId",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        "Backend",
+                                        {
+                                            "Fn::Select": [
+                                                2,
+                                                {
+                                                    "Fn::Split": [
+                                                        "/",
+                                                        {
+                                                            "Ref": "AWS::StackId"
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                ]
+                            }
+                        }
+                    ],
+                    "PlacementGroupName": {
+                        "Ref": "InstancesPlacementGroup"
+                    }
+                },
+                "DependsOn": "Backend0"
+            },
+            "Backend3": {
+                "Type": "AWS::EC2::Instance",
+                "Properties": {
+                    "ImageId": "resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2",
+                    "InstanceType": "i3en.24xlarge",
+                    "KeyName": {
+                        "Ref": "KeyName"
+                    },
+                    "UserData": {
+                        "Fn::Base64": {
+                            "Fn::Join": [
+                                "",
+                                [
+                                    "#!/bin/bash -e\n",
+                                    "\n",
+                                    "export WEKA_VERSION=\"4.2.5\"\n",
+                                    "export WEKA_GET_BASE_URL=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_SERVER=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_TOKEN=\"",
+                                    {
+                                        "Ref": "DistToken"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALL_URL=\"https://get.weka.io/dist/v1/install/4.2.5/4.2.5\"\n",
+                                    "export WEKA_PKG_URL=\"\"\n",
+                                    "export WEKA_THIS_INSTANCE=\"Backend3\"\n",
+                                    "export WEKA_CLUSTER_NAME=\"",
+                                    {
+                                        "Ref": "AWS::StackName"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALLATION_ID=\"",
+                                    {
+                                        "Fn::Select": [
+                                            2,
+                                            {
+                                                "Fn::Split": [
+                                                    "/",
+                                                    {
+                                                        "Ref": "AWS::StackId"
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_LOG_GROUP_NAME=\"",
+                                    {
+                                        "Fn::Join": [
+                                            "",
+                                            [
+                                                "/wekaio/",
+                                                {
+                                                    "Ref": "AWS::StackName"
+                                                },
+                                                "-",
+                                                {
+                                                    "Fn::Select": [
+                                                        0,
+                                                        {
+                                                            "Fn::Split": [
+                                                                "-",
+                                                                {
+                                                                    "Fn::Select": [
+                                                                        2,
+                                                                        {
+                                                                            "Fn::Split": [
+                                                                                "/",
+                                                                                {
+                                                                                    "Ref": "AWS::StackId"
+                                                                                }
+                                                                            ]
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AWS_DOWNLOAD_REGION=\"",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "RegionMap",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "DownloadRegion"
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_ADMIN_PASSWORD=$(cat << 'CFN_PASSWD_EOF'\n",
+                                    {
+                                        "Ref": "AdminPassword"
+                                    },
+                                    "\nCFN_PASSWD_EOF\n)\n",
+                                    "export PROXY=\"",
+                                    {
+                                        "Fn::If": [
+                                            "UseWekaProxy",
+                                            "http://private.prod.weka.io:1080",
+                                            {
+                                                "Fn::If": [
+                                                    "UseCustomProxy",
+                                                    {
+                                                        "Ref": "CustomProxy"
+                                                    },
+                                                    ""
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_CF_CONDITION_HANDLE=\"",
+                                    {
+                                        "Ref": "ClusterBootHandle"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AZ_COUNT=\"1\"\n",
+                                    "export WEKA_PROTECTION=\"2\"\n",
+                                    "export WEKA_TIERING_S3_BUCKET=\"",
+                                    {
+                                        "Fn::If": [
+                                            "HasTiering",
+                                            {
+                                                "Fn::If": [
+                                                    "CreateNewS3Bucket",
+                                                    {
+                                                        "Ref": "NewS3BucketName"
+                                                    },
+                                                    {
+                                                        "Ref": "ExistingS3BucketName"
+                                                    }
+                                                ]
+                                            },
+                                            ""
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_TIERING_SSD_PERCENT=\"",
+                                    {
+                                        "Ref": "TieringSsdPercent"
+                                    },
+                                    "\"\n",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "ScriptsMap",
+                                            "CloudInit",
+                                            "InstanceBoot"
+                                        ]
+                                    },
+                                    "\n",
+                                    "start_weka_backend\n"
+                                ]
+                            ]
+                        }
+                    },
+                    "IamInstanceProfile": {
+                        "Ref": "InstanceProfileBackend"
+                    },
+                    "BlockDeviceMappings": [
+                        {
+                            "DeviceName": "/dev/sdp",
+                            "Ebs": {
+                                "VolumeType": {
+                                    "Ref": "WekaVolumeType"
+                                },
+                                "VolumeSize": "188"
+                            }
+                        }
+                    ],
+                    "SubnetId": {
+                        "Ref": "SubnetId"
+                    },
+                    "SecurityGroupIds": [
+                        {
+                            "Ref": "HostSecurityGroup"
+                        }
+                    ],
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        {
+                                            "Ref": "AWS::StackName"
+                                        },
+                                        "Backend",
+                                        "3"
+                                    ]
+                                ]
+                            }
+                        },
+                        {
+                            "Key": "WekaInstallationId",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        "Backend",
+                                        {
+                                            "Fn::Select": [
+                                                2,
+                                                {
+                                                    "Fn::Split": [
+                                                        "/",
+                                                        {
+                                                            "Ref": "AWS::StackId"
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                ]
+                            }
+                        }
+                    ],
+                    "PlacementGroupName": {
+                        "Ref": "InstancesPlacementGroup"
+                    }
+                },
+                "DependsOn": "Backend0"
+            },
+            "Backend4": {
+                "Type": "AWS::EC2::Instance",
+                "Properties": {
+                    "ImageId": "resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2",
+                    "InstanceType": "i3en.24xlarge",
+                    "KeyName": {
+                        "Ref": "KeyName"
+                    },
+                    "UserData": {
+                        "Fn::Base64": {
+                            "Fn::Join": [
+                                "",
+                                [
+                                    "#!/bin/bash -e\n",
+                                    "\n",
+                                    "export WEKA_VERSION=\"4.2.5\"\n",
+                                    "export WEKA_GET_BASE_URL=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_SERVER=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_TOKEN=\"",
+                                    {
+                                        "Ref": "DistToken"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALL_URL=\"https://get.weka.io/dist/v1/install/4.2.5/4.2.5\"\n",
+                                    "export WEKA_PKG_URL=\"\"\n",
+                                    "export WEKA_THIS_INSTANCE=\"Backend4\"\n",
+                                    "export WEKA_CLUSTER_NAME=\"",
+                                    {
+                                        "Ref": "AWS::StackName"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALLATION_ID=\"",
+                                    {
+                                        "Fn::Select": [
+                                            2,
+                                            {
+                                                "Fn::Split": [
+                                                    "/",
+                                                    {
+                                                        "Ref": "AWS::StackId"
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_LOG_GROUP_NAME=\"",
+                                    {
+                                        "Fn::Join": [
+                                            "",
+                                            [
+                                                "/wekaio/",
+                                                {
+                                                    "Ref": "AWS::StackName"
+                                                },
+                                                "-",
+                                                {
+                                                    "Fn::Select": [
+                                                        0,
+                                                        {
+                                                            "Fn::Split": [
+                                                                "-",
+                                                                {
+                                                                    "Fn::Select": [
+                                                                        2,
+                                                                        {
+                                                                            "Fn::Split": [
+                                                                                "/",
+                                                                                {
+                                                                                    "Ref": "AWS::StackId"
+                                                                                }
+                                                                            ]
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AWS_DOWNLOAD_REGION=\"",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "RegionMap",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "DownloadRegion"
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_ADMIN_PASSWORD=$(cat << 'CFN_PASSWD_EOF'\n",
+                                    {
+                                        "Ref": "AdminPassword"
+                                    },
+                                    "\nCFN_PASSWD_EOF\n)\n",
+                                    "export PROXY=\"",
+                                    {
+                                        "Fn::If": [
+                                            "UseWekaProxy",
+                                            "http://private.prod.weka.io:1080",
+                                            {
+                                                "Fn::If": [
+                                                    "UseCustomProxy",
+                                                    {
+                                                        "Ref": "CustomProxy"
+                                                    },
+                                                    ""
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_CF_CONDITION_HANDLE=\"",
+                                    {
+                                        "Ref": "ClusterBootHandle"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AZ_COUNT=\"1\"\n",
+                                    "export WEKA_PROTECTION=\"2\"\n",
+                                    "export WEKA_TIERING_S3_BUCKET=\"",
+                                    {
+                                        "Fn::If": [
+                                            "HasTiering",
+                                            {
+                                                "Fn::If": [
+                                                    "CreateNewS3Bucket",
+                                                    {
+                                                        "Ref": "NewS3BucketName"
+                                                    },
+                                                    {
+                                                        "Ref": "ExistingS3BucketName"
+                                                    }
+                                                ]
+                                            },
+                                            ""
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_TIERING_SSD_PERCENT=\"",
+                                    {
+                                        "Ref": "TieringSsdPercent"
+                                    },
+                                    "\"\n",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "ScriptsMap",
+                                            "CloudInit",
+                                            "InstanceBoot"
+                                        ]
+                                    },
+                                    "\n",
+                                    "start_weka_backend\n"
+                                ]
+                            ]
+                        }
+                    },
+                    "IamInstanceProfile": {
+                        "Ref": "InstanceProfileBackend"
+                    },
+                    "BlockDeviceMappings": [
+                        {
+                            "DeviceName": "/dev/sdp",
+                            "Ebs": {
+                                "VolumeType": {
+                                    "Ref": "WekaVolumeType"
+                                },
+                                "VolumeSize": "188"
+                            }
+                        }
+                    ],
+                    "SubnetId": {
+                        "Ref": "SubnetId"
+                    },
+                    "SecurityGroupIds": [
+                        {
+                            "Ref": "HostSecurityGroup"
+                        }
+                    ],
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        {
+                                            "Ref": "AWS::StackName"
+                                        },
+                                        "Backend",
+                                        "4"
+                                    ]
+                                ]
+                            }
+                        },
+                        {
+                            "Key": "WekaInstallationId",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        "Backend",
+                                        {
+                                            "Fn::Select": [
+                                                2,
+                                                {
+                                                    "Fn::Split": [
+                                                        "/",
+                                                        {
+                                                            "Ref": "AWS::StackId"
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                ]
+                            }
+                        }
+                    ],
+                    "PlacementGroupName": {
+                        "Ref": "InstancesPlacementGroup"
+                    }
+                },
+                "DependsOn": "Backend0"
+            },
+            "Backend5": {
+                "Type": "AWS::EC2::Instance",
+                "Properties": {
+                    "ImageId": "resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2",
+                    "InstanceType": "i3en.24xlarge",
+                    "KeyName": {
+                        "Ref": "KeyName"
+                    },
+                    "UserData": {
+                        "Fn::Base64": {
+                            "Fn::Join": [
+                                "",
+                                [
+                                    "#!/bin/bash -e\n",
+                                    "\n",
+                                    "export WEKA_VERSION=\"4.2.5\"\n",
+                                    "export WEKA_GET_BASE_URL=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_SERVER=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_TOKEN=\"",
+                                    {
+                                        "Ref": "DistToken"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALL_URL=\"https://get.weka.io/dist/v1/install/4.2.5/4.2.5\"\n",
+                                    "export WEKA_PKG_URL=\"\"\n",
+                                    "export WEKA_THIS_INSTANCE=\"Backend5\"\n",
+                                    "export WEKA_CLUSTER_NAME=\"",
+                                    {
+                                        "Ref": "AWS::StackName"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALLATION_ID=\"",
+                                    {
+                                        "Fn::Select": [
+                                            2,
+                                            {
+                                                "Fn::Split": [
+                                                    "/",
+                                                    {
+                                                        "Ref": "AWS::StackId"
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_LOG_GROUP_NAME=\"",
+                                    {
+                                        "Fn::Join": [
+                                            "",
+                                            [
+                                                "/wekaio/",
+                                                {
+                                                    "Ref": "AWS::StackName"
+                                                },
+                                                "-",
+                                                {
+                                                    "Fn::Select": [
+                                                        0,
+                                                        {
+                                                            "Fn::Split": [
+                                                                "-",
+                                                                {
+                                                                    "Fn::Select": [
+                                                                        2,
+                                                                        {
+                                                                            "Fn::Split": [
+                                                                                "/",
+                                                                                {
+                                                                                    "Ref": "AWS::StackId"
+                                                                                }
+                                                                            ]
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AWS_DOWNLOAD_REGION=\"",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "RegionMap",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "DownloadRegion"
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_ADMIN_PASSWORD=$(cat << 'CFN_PASSWD_EOF'\n",
+                                    {
+                                        "Ref": "AdminPassword"
+                                    },
+                                    "\nCFN_PASSWD_EOF\n)\n",
+                                    "export PROXY=\"",
+                                    {
+                                        "Fn::If": [
+                                            "UseWekaProxy",
+                                            "http://private.prod.weka.io:1080",
+                                            {
+                                                "Fn::If": [
+                                                    "UseCustomProxy",
+                                                    {
+                                                        "Ref": "CustomProxy"
+                                                    },
+                                                    ""
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_CF_CONDITION_HANDLE=\"",
+                                    {
+                                        "Ref": "ClusterBootHandle"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AZ_COUNT=\"1\"\n",
+                                    "export WEKA_PROTECTION=\"2\"\n",
+                                    "export WEKA_TIERING_S3_BUCKET=\"",
+                                    {
+                                        "Fn::If": [
+                                            "HasTiering",
+                                            {
+                                                "Fn::If": [
+                                                    "CreateNewS3Bucket",
+                                                    {
+                                                        "Ref": "NewS3BucketName"
+                                                    },
+                                                    {
+                                                        "Ref": "ExistingS3BucketName"
+                                                    }
+                                                ]
+                                            },
+                                            ""
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_TIERING_SSD_PERCENT=\"",
+                                    {
+                                        "Ref": "TieringSsdPercent"
+                                    },
+                                    "\"\n",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "ScriptsMap",
+                                            "CloudInit",
+                                            "InstanceBoot"
+                                        ]
+                                    },
+                                    "\n",
+                                    "start_weka_backend\n"
+                                ]
+                            ]
+                        }
+                    },
+                    "IamInstanceProfile": {
+                        "Ref": "InstanceProfileBackend"
+                    },
+                    "BlockDeviceMappings": [
+                        {
+                            "DeviceName": "/dev/sdp",
+                            "Ebs": {
+                                "VolumeType": {
+                                    "Ref": "WekaVolumeType"
+                                },
+                                "VolumeSize": "188"
+                            }
+                        }
+                    ],
+                    "SubnetId": {
+                        "Ref": "SubnetId"
+                    },
+                    "SecurityGroupIds": [
+                        {
+                            "Ref": "HostSecurityGroup"
+                        }
+                    ],
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        {
+                                            "Ref": "AWS::StackName"
+                                        },
+                                        "Backend",
+                                        "5"
+                                    ]
+                                ]
+                            }
+                        },
+                        {
+                            "Key": "WekaInstallationId",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        "Backend",
+                                        {
+                                            "Fn::Select": [
+                                                2,
+                                                {
+                                                    "Fn::Split": [
+                                                        "/",
+                                                        {
+                                                            "Ref": "AWS::StackId"
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                ]
+                            }
+                        }
+                    ],
+                    "PlacementGroupName": {
+                        "Ref": "InstancesPlacementGroup"
+                    }
+                },
+                "DependsOn": "Backend0"
+            },
+            "Client0": {
+                "Type": "AWS::EC2::Instance",
+                "Properties": {
+                    "ImageId": "resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2",
+                    "InstanceType": "c5n.9xlarge",
+                    "KeyName": {
+                        "Ref": "KeyName"
+                    },
+                    "UserData": {
+                        "Fn::Base64": {
+                            "Fn::Join": [
+                                "",
+                                [
+                                    "#!/bin/bash -e\n",
+                                    "\n",
+                                    "export WEKA_VERSION=\"4.2.5\"\n",
+                                    "export WEKA_GET_BASE_URL=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_SERVER=\"https://get.weka.io\"\n",
+                                    "export WEKA_DIST_TOKEN=\"",
+                                    {
+                                        "Ref": "DistToken"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALL_URL=\"https://get.weka.io/dist/v1/install/4.2.5/4.2.5\"\n",
+                                    "export WEKA_PKG_URL=\"\"\n",
+                                    "export WEKA_THIS_INSTANCE=\"Client0\"\n",
+                                    "export WEKA_CLUSTER_NAME=\"",
+                                    {
+                                        "Ref": "AWS::StackName"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTALLATION_ID=\"",
+                                    {
+                                        "Fn::Select": [
+                                            2,
+                                            {
+                                                "Fn::Split": [
+                                                    "/",
+                                                    {
+                                                        "Ref": "AWS::StackId"
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_INSTANCES_WAIT_TIME=\"43199\"\n",
+                                    "export WEKA_LOG_GROUP_NAME=\"",
+                                    {
+                                        "Fn::Join": [
+                                            "",
+                                            [
+                                                "/wekaio/",
+                                                {
+                                                    "Ref": "AWS::StackName"
+                                                },
+                                                "-",
+                                                {
+                                                    "Fn::Select": [
+                                                        0,
+                                                        {
+                                                            "Fn::Split": [
+                                                                "-",
+                                                                {
+                                                                    "Fn::Select": [
+                                                                        2,
+                                                                        {
+                                                                            "Fn::Split": [
+                                                                                "/",
+                                                                                {
+                                                                                    "Ref": "AWS::StackId"
+                                                                                }
+                                                                            ]
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_AWS_DOWNLOAD_REGION=\"",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "RegionMap",
+                                            {
+                                                "Ref": "AWS::Region"
+                                            },
+                                            "DownloadRegion"
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_ADMIN_PASSWORD=$(cat << 'CFN_PASSWD_EOF'\n",
+                                    {
+                                        "Ref": "AdminPassword"
+                                    },
+                                    "\nCFN_PASSWD_EOF\n)\n",
+                                    "export PROXY=\"",
+                                    {
+                                        "Fn::If": [
+                                            "UseWekaProxy",
+                                            "http://private.prod.weka.io:1080",
+                                            {
+                                                "Fn::If": [
+                                                    "UseCustomProxy",
+                                                    {
+                                                        "Ref": "CustomProxy"
+                                                    },
+                                                    ""
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    "\"\n",
+                                    "export WEKA_CF_CONDITION_HANDLE=\"",
+                                    {
+                                        "Ref": "ClientsJoinHandle"
+                                    },
+                                    "\"\n",
+                                    "export WEKA_ADD_CLIENTS_FLAGS=\"\"\n",
+                                    "export WEKA_HOST=\"",
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend0",
+                                            "PrivateIp"
+                                        ]
+                                    },
+                                    "\"\n",
+                                    {
+                                        "Fn::FindInMap": [
+                                            "ScriptsMap",
+                                            "CloudInit",
+                                            "InstanceBoot"
+                                        ]
+                                    },
+                                    "\n",
+                                    "start_weka_client\n"
+                                ]
+                            ]
+                        }
+                    },
+                    "IamInstanceProfile": {
+                        "Ref": "InstanceProfileClient"
+                    },
+                    "BlockDeviceMappings": [
+                        {
+                            "DeviceName": "/dev/sdp",
+                            "Ebs": {
+                                "VolumeType": {
+                                    "Ref": "WekaVolumeType"
+                                },
+                                "VolumeSize": "48"
+                            }
+                        }
+                    ],
+                    "SubnetId": {
+                        "Ref": "SubnetId"
+                    },
+                    "SecurityGroupIds": [
+                        {
+                            "Ref": "HostSecurityGroup"
+                        }
+                    ],
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        {
+                                            "Ref": "AWS::StackName"
+                                        },
+                                        "Client",
+                                        "0"
+                                    ]
+                                ]
+                            }
+                        },
+                        {
+                            "Key": "WekaInstallationId",
+                            "Value": {
+                                "Fn::Join": [
+                                    "-",
+                                    [
+                                        "Client",
+                                        {
+                                            "Fn::Select": [
+                                                2,
+                                                {
+                                                    "Fn::Split": [
+                                                        "/",
+                                                        {
+                                                            "Ref": "AWS::StackId"
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                ]
+                            }
+                        }
+                    ]
+                },
+                "DependsOn": "Backend0"
+            },
+            "TieringBucket": {
+                "Type": "AWS::S3::Bucket",
+                "DeletionPolicy": "Retain",
+                "Condition": "CreateNewS3Bucket",
+                "Properties": {
+                    "BucketName": {
+                        "Ref": "NewS3BucketName"
+                    }
+                }
+            },
+            "TieringBucketPolicy": {
+                "Type": "AWS::IAM::Policy",
+                "Condition": "HasTiering",
+                "Properties": {
+                    "PolicyName": "TieringBucketAccess",
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": [
+                                    "s3:DeleteObject",
+                                    "s3:GetObject",
+                                    "s3:ListBucket",
+                                    "s3:PutObject"
+                                ],
+                                "Resource": [
+                                    {
+                                        "Fn::Join": [
+                                            "",
+                                            [
+                                                "arn:",
+                                                {
+                                                    "Ref": "AWS::Partition"
+                                                },
+                                                ":s3:::",
+                                                {
+                                                    "Fn::If": [
+                                                        "CreateNewS3Bucket",
+                                                        {
+                                                            "Ref": "NewS3BucketName"
+                                                        },
+                                                        {
+                                                            "Ref": "ExistingS3BucketName"
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        ]
+                                    },
+                                    {
+                                        "Fn::Join": [
+                                            "",
+                                            [
+                                                "arn:",
+                                                {
+                                                    "Ref": "AWS::Partition"
+                                                },
+                                                ":s3:::",
+                                                {
+                                                    "Fn::If": [
+                                                        "CreateNewS3Bucket",
+                                                        {
+                                                            "Ref": "NewS3BucketName"
+                                                        },
+                                                        {
+                                                            "Ref": "ExistingS3BucketName"
+                                                        }
+                                                    ]
+                                                },
+                                                "/*"
+                                            ]
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    "Roles": [
+                        {
+                            "Ref": "WekaBackendRole"
+                        }
+                    ]
+                }
+            }
+        },
+        "Outputs": {
+            "UI0": {
+                "Description": "Backend 0 UI",
+                "Value": {
+                    "Fn::Join": [
+                        "",
+                        [
+                            "http://",
+                            {
+                                "Fn::If": [
+                                    "IsPublicSubnet",
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend0",
+                                            "PublicIp"
+                                        ]
+                                    },
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend0",
+                                            "PrivateIp"
+                                        ]
+                                    }
+                                ]
+                            },
+                            ":14000"
+                        ]
+                    ]
+                }
+            },
+            "UI1": {
+                "Description": "Backend 1 UI",
+                "Value": {
+                    "Fn::Join": [
+                        "",
+                        [
+                            "http://",
+                            {
+                                "Fn::If": [
+                                    "IsPublicSubnet",
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend1",
+                                            "PublicIp"
+                                        ]
+                                    },
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend1",
+                                            "PrivateIp"
+                                        ]
+                                    }
+                                ]
+                            },
+                            ":14000"
+                        ]
+                    ]
+                }
+            },
+            "UI2": {
+                "Description": "Backend 2 UI",
+                "Value": {
+                    "Fn::Join": [
+                        "",
+                        [
+                            "http://",
+                            {
+                                "Fn::If": [
+                                    "IsPublicSubnet",
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend2",
+                                            "PublicIp"
+                                        ]
+                                    },
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend2",
+                                            "PrivateIp"
+                                        ]
+                                    }
+                                ]
+                            },
+                            ":14000"
+                        ]
+                    ]
+                }
+            },
+            "UI3": {
+                "Description": "Backend 3 UI",
+                "Value": {
+                    "Fn::Join": [
+                        "",
+                        [
+                            "http://",
+                            {
+                                "Fn::If": [
+                                    "IsPublicSubnet",
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend3",
+                                            "PublicIp"
+                                        ]
+                                    },
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend3",
+                                            "PrivateIp"
+                                        ]
+                                    }
+                                ]
+                            },
+                            ":14000"
+                        ]
+                    ]
+                }
+            },
+            "UI4": {
+                "Description": "Backend 4 UI",
+                "Value": {
+                    "Fn::Join": [
+                        "",
+                        [
+                            "http://",
+                            {
+                                "Fn::If": [
+                                    "IsPublicSubnet",
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend4",
+                                            "PublicIp"
+                                        ]
+                                    },
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend4",
+                                            "PrivateIp"
+                                        ]
+                                    }
+                                ]
+                            },
+                            ":14000"
+                        ]
+                    ]
+                }
+            },
+            "UI5": {
+                "Description": "Backend 5 UI",
+                "Value": {
+                    "Fn::Join": [
+                        "",
+                        [
+                            "http://",
+                            {
+                                "Fn::If": [
+                                    "IsPublicSubnet",
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend5",
+                                            "PublicIp"
+                                        ]
+                                    },
+                                    {
+                                        "Fn::GetAtt": [
+                                            "Backend5",
+                                            "PrivateIp"
+                                        ]
+                                    }
+                                ]
+                            },
+                            ":14000"
+                        ]
+                    ]
+                }
+            }
+        },
+        "Parameters": {
+            "VpcId": {
+                "Type": "AWS::EC2::VPC::Id",
+                "Description": "VPC ID in which the cluster would be installed"
+            },
+            "NetworkTopology": {
+                "Type": "String",
+                "Description": "If you are deploying in a private VPC without public access to the internet (not using NAT),\n            you can use either a custom proxy or a Weka VPC endpoint to access Weka services.\n            If you have not already created a VPC endpoint to Weka services or an S3 Gateway within this VPC,\n            follow the link to create one: https://eu-west-1.console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/create/review?templateURL=https://proxy-prerequisites.s3.eu-central-1.amazonaws.com/prerequisites.json&stackName=proxy-prerequisites",
+                "Default": "Public subnet",
+                "AllowedValues": [
+                    "Public subnet",
+                    "Private subnet with NAT internet routing",
+                    "Private subnet using Weka VPC endpoint",
+                    "Private subnet using custom proxy"
+                ]
+            },
+            "CustomProxy": {
+                "Type": "String",
+                "Description": "(optional) Custom proxy for private network internet access. only relevant when `Private network using custom proxy` is selected as the Network Topology.",
+                "Default": ""
+            },
+            "KeyName": {
+                "Type": "AWS::EC2::KeyPair::KeyName",
+                "Description": "A key with which you can connect to the new instances"
+            },
+            "DistToken": {
+                "Type": "String",
+                "Description": "API token for get.weka.io"
+            },
+            "AdminPassword": {
+                "Type": "String",
+                "Description": "Password for first \"admin\" user created in the cluster (default: \"admin\")\nNon-default password must contain at least 8 characters, with at least one uppercase letter, one lowercase letter, and one number or special character",
+                "NoEcho": true,
+                "Default": "",
+                "AllowedPattern": "^$|^((?=.*\\d)|(?=.*?[#?!@$%^&*-]))(?=.*[a-z])(?=.*[A-Z]).{8,}$",
+                "ConstraintDescription": "Must contain at least 8 characters, and have at least one uppercase letter, one lowercase letter, and one number or special character"
+            },
+            "WekaVolumeType": {
+                "Type": "String",
+                "Description": "Volume type for the Weka partition.\nGP3 is not yet available in all zones/regions (e.g., not available in local zones). In such a case, you must select the GP2 volume type. When available, using GP3 is preferred.",
+                "Default": "gp3",
+                "AllowedValues": [
+                    "gp2",
+                    "gp3"
+                ]
+            },
+            "NewS3BucketName": {
+                "Type": "String",
+                "Description": "(optional) New S3 bucket to create and attach to the filesystem created by the template. The bucket will not be deleted when the stack is destroyed.",
+                "Default": ""
+            },
+            "ExistingS3BucketName": {
+                "Type": "String",
+                "Description": "(optional) Existing S3 bucket to attach to the filesystem created by the template. The bucket has to be in the same region where the cluster is deployed. If this parameter is provided, the New S3 Bucket parameter is ignored.",
+                "Default": ""
+            },
+            "TieringSsdPercent": {
+                "Type": "Number",
+                "Description": "(optional) When one of the S3 bucket parameters is provided for tiering, this parameter sets how much of the filesystem capacity should reside on SSD. For example, if this parameter is 20 and the total available SSD capacity is 20GB, the total capacity would be 100GB.",
+                "Default": 10
+            },
+            "SubnetId": {
+                "Type": "AWS::EC2::Subnet::Id",
+                "Description": "Subnet ID in which the cluster would be installed"
+            }
+        },
+        "Conditions": {
+            "UseExistingS3Bucket": {
+                "Fn::Not": [
+                    {
+                        "Fn::Equals": [
+                            {
+                                "Ref": "ExistingS3BucketName"
+                            },
+                            ""
+                        ]
+                    }
+                ]
+            },
+            "CreateNewS3Bucket": {
+                "Fn::And": [
+                    {
+                        "Fn::Equals": [
+                            {
+                                "Ref": "ExistingS3BucketName"
+                            },
+                            ""
+                        ]
+                    },
+                    {
+                        "Fn::Not": [
+                            {
+                                "Fn::Equals": [
+                                    {
+                                        "Ref": "NewS3BucketName"
+                                    },
+                                    ""
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            },
+            "HasTiering": {
+                "Fn::Or": [
+                    {
+                        "Fn::Not": [
+                            {
+                                "Fn::Equals": [
+                                    {
+                                        "Ref": "NewS3BucketName"
+                                    },
+                                    ""
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "Fn::Not": [
+                            {
+                                "Fn::Equals": [
+                                    {
+                                        "Ref": "ExistingS3BucketName"
+                                    },
+                                    ""
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            },
+            "IsPublicSubnet": {
+                "Fn::Equals": [
+                    {
+                        "Ref": "NetworkTopology"
+                    },
+                    "Public subnet"
+                ]
+            },
+            "UseWekaProxy": {
+                "Fn::Equals": [
+                    {
+                        "Ref": "NetworkTopology"
+                    },
+                    "Private subnet using Weka VPC endpoint"
+                ]
+            },
+            "UseCustomProxy": {
+                "Fn::Equals": [
+                    {
+                        "Ref": "NetworkTopology"
+                    },
+                    "Private subnet using custom proxy"
+                ]
+            }
+        },
+        "Metadata": {
+            "AWS::CloudFormation::Interface": {
+                "ParameterGroups": [
+                    {
+                        "Label": {
+                            "default": "Network Configuration"
+                        },
+                        "Parameters": [
+                            "VpcId",
+                            "SubnetId",
+                            "HttpProxy",
+                            "NetworkTopology",
+                            "CustomProxy"
+                        ]
+                    },
+                    {
+                        "Label": {
+                            "default": "Amazon EC2 Configuration"
+                        },
+                        "Parameters": [
+                            "KeyName",
+                            "WekaVolumeType"
+                        ]
+                    },
+                    {
+                        "Label": {
+                            "default": "WekaIO Download Site API Token"
+                        },
+                        "Parameters": [
+                            "DistToken"
+                        ]
+                    },
+                    {
+                        "Label": {
+                            "default": "Cluster Configuration"
+                        },
+                        "Parameters": [
+                            "AdminPassword"
+                        ]
+                    },
+                    {
+                        "Label": {
+                            "default": "Tiering Configuration"
+                        },
+                        "Parameters": [
+                            "NewS3BucketName",
+                            "ExistingS3BucketName",
+                            "TieringSsdPercent"
+                        ]
+                    }
+                ],
+                "ParameterLabels": {
+                    "VpcId": {
+                        "default": "VPC"
+                    },
+                    "SubnetId": {
+                        "default": "Subnet"
+                    },
+                    "SubnetId1": {
+                        "default": "Subnet 1"
+                    },
+                    "SubnetId2": {
+                        "default": "Subnet 2"
+                    },
+                    "SubnetId3": {
+                        "default": "Subnet 3"
+                    },
+                    "NetworkTopology": {
+                        "default": "Network Topology"
+                    },
+                    "CustomProxy": {
+                        "default": "Custom Proxy"
+                    },
+                    "KeyName": {
+                        "default": "SSH Key"
+                    },
+                    "WekaVolumeType": {
+                        "default": "Weka Volume Type"
+                    },
+                    "DistToken": {
+                        "default": "API Token"
+                    },
+                    "AdminPassword": {
+                        "default": "Admin Password"
+                    },
+                    "NewS3BucketName": {
+                        "default": "New S3 Bucket"
+                    },
+                    "ExistingS3BucketName": {
+                        "default": "Existing S3 Bucket"
+                    },
+                    "TieringSsdPercent": {
+                        "default": "Tiering SSD Percent"
+                    },
+                    "HttpProxy": {
+                        "default": "HTTP/HTTPS Proxy"
+                    }
+                }
+            }
+        }
+    },
+    "StagesAvailable": [
+        "Original",
+        "Processed"
+    ]
+}
